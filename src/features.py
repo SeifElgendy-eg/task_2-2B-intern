@@ -3,6 +3,7 @@ import pandas as pd
 
 from scipy.stats import skew, kurtosis
 from scipy.interpolate import Akima1DInterpolator
+from scipy.signal import find_peaks
 
 from src.annotations import find_nan_blocks
 
@@ -88,7 +89,7 @@ def impute_record_signal(rec, base_path, fs=250):
 
     return cleaned, sig_min, sig_max, imputed_mask, hold_extreme_mask
 
-def extract_features_for_dataset(windows_df, cudb_set, cudb_path, vfdb_path, clip_tol=0.05, fs=250):
+def extract_features_for_dataset(windows_df, cudb_set, cudb_path, vfdb_path, clip_tol=0.05, fs=250, include_rr=True):
     windows_df = windows_df.copy()
     windows_df['record'] = windows_df['record'].astype(str)
     records_in_set = windows_df['record'].unique()
@@ -121,6 +122,8 @@ def extract_features_for_dataset(windows_df, cudb_set, cudb_path, vfdb_path, cli
         feats['sample_entropy'] = compute_sample_entropy(window)
         feats.update(compute_autocorrelation_features(window, fs))
         feats.update(compute_derivative_features(window))
+        if include_rr:
+            feats.update(compute_rr_features(window, fs))
 
         feats['record'] = row['record']
         feats['db'] = row['db']
@@ -203,3 +206,29 @@ def compute_derivative_features(window):
         max_abs_diff=np.max(np.abs(d)),
         turning_points=turning_points / len(window),  # normalized so window length doesn't bias it
     )
+
+
+def compute_rr_features(window, fs, min_rr_s=0.4):
+    """Beat-detection-based RR-interval features: n_beats, RR mean/std/CV, and an explicit
+    beat_detected flag. Adaptive height threshold (mean + 1 std) instead of a fixed value,
+    since window amplitude varies a lot across records/rhythms. min_rr_s=0.4 caps physiologically
+    plausible heart rate at 150bpm to avoid double-counting noisy sub-peaks as separate beats.
+
+    beat_detected is kept separate from n_beats/rr_mean because 'no organized beats found' is
+    itself informative (expected for VF/VT) and shouldn't be silently indistinguishable from
+    'found exactly one beat, so RR stats are undefined'.
+    """
+    distance = int(min_rr_s * fs)
+    height = window.mean() + window.std()
+    peaks, _ = find_peaks(window, height=height, distance=distance)
+    n_beats = len(peaks)
+
+    if n_beats < 2:
+        return dict(n_beats=float(n_beats), rr_mean=0.0, rr_std=0.0, rr_cv=0.0, beat_detected=0.0)
+
+    rr = np.diff(peaks) / fs
+    rr_mean = rr.mean()
+    rr_std = rr.std()
+    rr_cv = rr_std / rr_mean if rr_mean > 0 else 0.0
+
+    return dict(n_beats=float(n_beats), rr_mean=rr_mean, rr_std=rr_std, rr_cv=rr_cv, beat_detected=1.0)
